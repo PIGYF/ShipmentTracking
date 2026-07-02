@@ -1,14 +1,14 @@
 # Shipment Tracking
 
-公司物流 shipment 查询原型。当前阶段只实现 DSV public tracking 的拉取验证：
+Excel-based shipment tracking prototype.
 
-- 从 Excel 读取 `运单` 和 `货代`
-- 对 `货代 = DSV` 的行，用 House Bill number 查询 myDSV public tracking
-- 先调用 public search 拿 `randomIdentifier`
-- 再调用 shipment detail 接口拿 milestones
-- 输出 JSON，后续再接 Excel 回写/刷新逻辑
+Supported now:
 
-## 安装
+- DSV public tracking
+- DGF tracking via DHL Shipment Tracking - Unified API
+- Maersk provider template
+
+## Setup
 
 ```powershell
 python -m venv .venv
@@ -16,20 +16,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 运行
+Put local credentials in `.env`. Do not commit `.env`.
+
+## Run
+
+DSV:
 
 ```powershell
-python -m shipment_tracking.cli --excel "C:\Users\Administrator\Desktop\test.xlsx" --output exports\dsv_results.json
+python -m shipment_tracking.cli --dsv RTM0344100 --output exports\dsv_one.json
 ```
 
-也可以直接查单号：
+DGF:
 
 ```powershell
-python -m shipment_tracking.cli --dsv RTM0344100 --output exports\one.json
+python -m shipment_tracking.cli --dgf FRAA47253 --output exports\dgf_one.json
 ```
 
-## 数据安全
+DGF from Excel and write an updated copy:
 
-不要把 `.env`、API key、账号、密码提交到 GitHub。真实凭据只放本机 `.env` 或 GitHub Actions Secrets。
+```powershell
+python -m shipment_tracking.cli --excel "D:\Downloads\2026-Import tracking list (1).xlsx" --sheet 2026 --carrier dgf --output exports\dgf_results.json --update-excel "exports\2026-Import tracking list.updated.xlsx"
+```
 
-当前 DSV public tracking 流程不需要 Developer Portal key；如果后续改用正式 DSV API，再按 `.env.example` 补充配置。
+Maersk template:
+
+```powershell
+python -m shipment_tracking.cli --maersk 261238481 --output exports\maersk_one.json
+```
+
+Current DGF key is only for rows where `货代 = DGF`, not `DHL EXPRESS`.
