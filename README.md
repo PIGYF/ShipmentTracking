@@ -1,12 +1,14 @@
 # Shipment Tracking
 
-Excel-based shipment tracking prototype.
+Excel shipment tracking refresh tool.
 
-Supported now:
+Currently supported:
 
-- DSV public tracking
-- DGF tracking via DHL Shipment Tracking - Unified API
-- Maersk provider template
+- DSV
+- DGF
+- MAERSK
+
+The current DGF key only applies to rows where `货代 = DGF`, not `DHL EXPRESS`.
 
 ## Setup
 
@@ -16,32 +18,42 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Put local credentials in `.env`. Do not commit `.env`.
+Put API credentials in local `.env`. Do not commit `.env`.
 
 ## Run
 
-DSV:
+If `python` is not available in PowerShell, use the included script:
 
 ```powershell
-python -m shipment_tracking.cli --dsv RTM0344100 --output exports\dsv_one.json
+.\run_refresh.ps1 "D:\Downloads\2026-Import tracking list.xlsx"
 ```
 
-DGF:
+Or use the batch file:
+
+```bat
+run_refresh.bat "D:\Downloads\2026-Import tracking list.xlsx"
+```
+
+Refresh pending supported shipments and save an updated Excel copy:
 
 ```powershell
-python -m shipment_tracking.cli --dgf FRAA47253 --output exports\dgf_one.json
+python -m shipment_tracking.refresh_excel "D:\Downloads\2026-Import tracking list.xlsx"
 ```
 
-DGF from Excel and write an updated copy:
+Test without calling APIs or writing Excel:
 
 ```powershell
-python -m shipment_tracking.cli --excel "D:\Downloads\2026-Import tracking list (1).xlsx" --sheet 2026 --carrier dgf --output exports\dgf_results.json --update-excel "exports\2026-Import tracking list.updated.xlsx"
+python -m shipment_tracking.refresh_excel "D:\Downloads\2026-Import tracking list.xlsx" --dry-run
 ```
 
-Maersk template:
+Test a small batch:
 
 ```powershell
-python -m shipment_tracking.cli --maersk 261238481 --output exports\maersk_one.json
+python -m shipment_tracking.refresh_excel "D:\Downloads\2026-Import tracking list.xlsx" --limit 10
 ```
 
-Current DGF key is only for rows where `货代 = DGF`, not `DHL EXPRESS`.
+By default it reads sheet `2026`, processes only `状态显示 = 未送货`, skips unsupported forwarders, and writes to:
+
+```text
+exports\2026-Import tracking list.updated.xlsx
+```

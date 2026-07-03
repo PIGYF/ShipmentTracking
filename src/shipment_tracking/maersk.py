@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import os
 from typing import Any
 from urllib import parse, request
 
+from .models import TrackingRecord
+from .time_utils import to_china_naive
+
 
 DEFAULT_TOKEN_URL = "https://api.maersk.com/customer-identity/oauth/v2/access_token"
-DEFAULT_API_BASE_URL = "https://api.maersk.com"
-DEFAULT_EVENTS_PATH = "/track-and-trace/events"
+DEFAULT_API_BASE_URL = "https://api.maersk.com/track-and-trace-private"
+DEFAULT_EVENTS_PATH = "/events"
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,48 @@ class MaerskTrackingResult:
             "status_code": self.status_code,
             "payload": self.payload,
         }
+
+    def to_record(self) -> TrackingRecord:
+        events = _events(self.payload)
+        if not self.found:
+            return TrackingRecord(
+                carrier="MAERSK",
+                tracking_number=self.query,
+                found=False,
+                raw={"payload": self.payload} if isinstance(self.payload, dict) else {},
+            )
+
+        final_sequence = _final_arrival_sequence(events)
+        eta_arrival_event = _transport_arrival_at_sequence(events, "EST", final_sequence)
+        actual_arrival_event = _transport_arrival_at_sequence(events, "ACT", final_sequence)
+        actual_discharge_event = _equipment_discharge_at_sequence(events, final_sequence)
+
+        eta_arrival = to_china_naive(_parse_datetime(eta_arrival_event.get("eventDateTime")) if eta_arrival_event else None)
+        actual_arrival = to_china_naive(_parse_datetime(actual_arrival_event.get("eventDateTime")) if actual_arrival_event else None)
+        fallback_discharge = to_china_naive(_parse_datetime(actual_discharge_event.get("eventDateTime")) if actual_discharge_event else None)
+        arrival_date = actual_arrival or eta_arrival or fallback_discharge
+        arrival_date_type = "ACTUAL" if actual_arrival or fallback_discharge else "ESTIMATED" if eta_arrival else None
+
+        final_event = actual_arrival_event or eta_arrival_event or actual_discharge_event or {}
+        transport_call = final_event.get("transportCall") if isinstance(final_event.get("transportCall"), dict) else {}
+        vessel = transport_call.get("vessel") if isinstance(transport_call.get("vessel"), dict) else {}
+
+        return TrackingRecord(
+            carrier="MAERSK",
+            tracking_number=self.query,
+            found=True,
+            status=_latest_classifier(events),
+            eta_arrival=eta_arrival,
+            actual_arrival=actual_arrival or fallback_discharge,
+            arrival_date=arrival_date,
+            arrival_date_type=arrival_date_type,
+            destination=_transport_location(transport_call),
+            master_bill=self.query if self.query_type == "transportDocumentReference" else None,
+            container_numbers=_reference_values(events, "EQ"),
+            vessel_name=vessel.get("vesselName"),
+            voyage_number=transport_call.get("exportVoyageNumber") or transport_call.get("carrierVoyageNumber"),
+            raw={"payload": self.payload} if isinstance(self.payload, dict) else {},
+        )
 
 
 class MaerskClient:
@@ -102,7 +148,11 @@ class MaerskClient:
         req = request.Request(
             self.token_url,
             data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "Consumer-Key": self.consumer_key,
+            },
             method="POST",
         )
         with request.urlopen(req, timeout=self.timeout) as resp:
@@ -141,3 +191,114 @@ def _read_json(raw: bytes) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return {"raw": text}
+
+
+def _events(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [event for event in payload if isinstance(event, dict)]
+    if not isinstance(payload, dict):
+        return []
+    found: list[dict[str, Any]] = []
+    for key in ("events", "data", "transportEvents", "shipmentEvents", "equipmentEvents"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            found.extend(event for event in value if isinstance(event, dict))
+    return found
+
+
+def _final_arrival_sequence(events: list[dict[str, Any]]) -> int:
+    sequences = [
+        _sequence(event)
+        for event in events
+        if event.get("eventType") == "TRANSPORT" and event.get("transportEventTypeCode") == "ARRI"
+    ]
+    valid = [sequence for sequence in sequences if sequence >= 0]
+    return max(valid) if valid else -1
+
+
+def _transport_arrival_at_sequence(
+    events: list[dict[str, Any]],
+    classifier: str,
+    sequence: int,
+) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event.get("eventType") == "TRANSPORT"
+        and event.get("transportEventTypeCode") == "ARRI"
+        and event.get("eventClassifierCode") == classifier
+        and _sequence(event) == sequence
+    ]
+    return _final_event_by_sequence(candidates)
+
+
+def _equipment_discharge_at_sequence(events: list[dict[str, Any]], sequence: int) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event.get("eventType") == "EQUIPMENT"
+        and event.get("equipmentEventTypeCode") == "DISC"
+        and event.get("eventClassifierCode") == "ACT"
+        and _sequence(event) == sequence
+    ]
+    return _final_event_by_sequence(candidates)
+
+
+def _final_event_by_sequence(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not events:
+        return None
+    return max(events, key=lambda event: (_sequence(event), _parse_datetime(event.get("eventDateTime")) or datetime.min))
+
+
+def _sequence(event: dict[str, Any]) -> int:
+    transport_call = event.get("transportCall")
+    if not isinstance(transport_call, dict):
+        return -1
+    value = transport_call.get("transportCallSequenceNumber")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _transport_location(transport_call: dict[str, Any]) -> str | None:
+    location = transport_call.get("location") if isinstance(transport_call.get("location"), dict) else {}
+    name = location.get("locationName")
+    un_location = transport_call.get("UNLocationCode")
+    if name and un_location:
+        return f"{name}, {un_location}"
+    return name or un_location
+
+
+def _reference_values(events: list[dict[str, Any]], reference_type: str) -> list[str]:
+    values: list[str] = []
+    for event in events:
+        references = event.get("references")
+        if not isinstance(references, list):
+            continue
+        for reference in references:
+            if not isinstance(reference, dict) or reference.get("referenceType") != reference_type:
+                continue
+            value = str(reference.get("referenceValue") or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _latest_classifier(events: list[dict[str, Any]]) -> str | None:
+    dated = [(event, _parse_datetime(event.get("eventDateTime"))) for event in events]
+    dated = [(event, value) for event, value in dated if value]
+    if not dated:
+        return None
+    event, _ = max(dated, key=lambda item: item[1])
+    parts = [event.get("eventType"), event.get("transportEventTypeCode") or event.get("equipmentEventTypeCode") or event.get("shipmentEventTypeCode"), event.get("eventClassifierCode")]
+    return ":".join(str(part) for part in parts if part)

@@ -8,6 +8,7 @@ from typing import Any
 from urllib import parse, request
 
 from .models import TrackingRecord
+from .time_utils import to_china_naive
 
 
 DEFAULT_API_BASE_URL = "https://api-eu.dhl.com/track"
@@ -67,6 +68,9 @@ class DgfTrackingResult:
 
         actual_arrival = _find_event_timestamp(events, "actual arrival at destination")
         eta_arrival = _parse_datetime(_first(route_item, "dgf:estimatedArrivalDate"))
+        actual_arrival = to_china_naive(actual_arrival)
+        eta_arrival = to_china_naive(eta_arrival)
+        departure_date = to_china_naive(_parse_datetime(_first(route_item, "dgf:estimatedDepartureDate")))
         arrival_date = actual_arrival or eta_arrival
         arrival_date_type = "ACTUAL" if actual_arrival else "ESTIMATED" if eta_arrival else None
 
@@ -85,7 +89,7 @@ class DgfTrackingResult:
             actual_arrival=actual_arrival,
             arrival_date=arrival_date,
             arrival_date_type=arrival_date_type,
-            departure_date=_parse_datetime(_first(route_item, "dgf:estimatedDepartureDate")),
+            departure_date=departure_date,
             origin=_location_name(shipment.get("origin")),
             destination=_location_name(shipment.get("destination")),
             master_bill=master_bills[0] if master_bills else None,
@@ -106,10 +110,8 @@ class DgfClient:
         api_base_url: str | None = None,
         timeout: int = 30,
     ) -> None:
-        self.api_key = api_key or os.getenv("DGF_API_KEY") or os.getenv("DHL_API_KEY", "")
-        self.api_base_url = (
-            api_base_url or os.getenv("DGF_API_BASE_URL") or os.getenv("DHL_API_BASE_URL", DEFAULT_API_BASE_URL)
-        ).rstrip("/")
+        self.api_key = api_key or os.getenv("DGF_API_KEY", "")
+        self.api_base_url = (api_base_url or os.getenv("DGF_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
         self.timeout = timeout
 
     def track(self, tracking_number: str, service: str | None = None) -> DgfTrackingResult:
