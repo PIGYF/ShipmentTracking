@@ -41,15 +41,16 @@ def update_tracking_workbook(
     output_path: str | Path,
     sheet_name: str | None = None,
     remarks: dict[str, str] | None = None,
+    run_label: str | None = None,
 ) -> int:
     records = list(records)
     remarks = remarks or {}
     if os.name == "nt" and os.getenv("SHIPMENT_TRACKING_USE_EXCEL_COM") == "1":
         try:
-            return _update_tracking_workbook_with_excel_com(source_path, records, output_path, sheet_name, remarks)
+            return _update_tracking_workbook_with_excel_com(source_path, records, output_path, sheet_name, remarks, run_label)
         except RuntimeError:
             pass
-    return _update_tracking_workbook_with_openpyxl(source_path, records, output_path, sheet_name, remarks)
+    return _update_tracking_workbook_with_openpyxl(source_path, records, output_path, sheet_name, remarks, run_label)
 
 
 def _update_tracking_workbook_with_openpyxl(
@@ -58,6 +59,7 @@ def _update_tracking_workbook_with_openpyxl(
     output_path: str | Path,
     sheet_name: str | None,
     remarks: dict[str, str],
+    run_label: str | None,
 ) -> int:
     source = Path(source_path)
     output = Path(output_path)
@@ -98,11 +100,15 @@ def _update_tracking_workbook_with_openpyxl(
         row_changed = False
         if record and record.found:
             if record.arrival_date:
-                row_changed |= _set_if_changed(
+                changed, old_display, new_display = _set_date_if_changed(
                     sheet.cell(row=row, column=arrival_col),
                     date_only(record.arrival_date),
                     date_format="m/d/yyyy",
                 )
+                row_changed |= changed
+                if changed:
+                    change_remark = _date_change_remark(run_label, old_display, new_display)
+                    remark = _join_remarks(remark, change_remark)
 
         if remark:
             cell = sheet.cell(row=row, column=exception_col)
@@ -131,6 +137,7 @@ def _update_tracking_workbook_with_excel_com(
     output_path: str | Path,
     sheet_name: str | None,
     remarks: dict[str, str],
+    run_label: str | None,
 ) -> int:
     source = Path(source_path).resolve()
     output = Path(output_path).resolve()
@@ -155,6 +162,7 @@ def _update_tracking_workbook_with_excel_com(
                 str(output),
                 sheet_name or "",
                 str(payload_path),
+                run_label or "",
             ],
             capture_output=True,
             text=True,
@@ -316,9 +324,32 @@ def _set_if_changed(cell, new_value, date_format: str | None = None) -> bool:
     return True
 
 
+def _set_date_if_changed(cell, new_value, date_format: str | None = None) -> tuple[bool, str, str]:
+    if new_value is None:
+        return False, "", ""
+    old_value = _normalize_cell_value(cell.value)
+    comparable = _normalize_cell_value(new_value)
+    if old_value == comparable:
+        return False, _display_cell_value(cell.value), _display_cell_value(new_value)
+    old_display = _display_cell_value(cell.value)
+    new_display = _display_cell_value(new_value)
+    cell.value = new_value
+    if date_format:
+        cell.number_format = date_format
+    cell.fill = FILL_CHANGED
+    return True, old_display, new_display
+
+
 def _normalize_cell_value(value):
     if isinstance(value, datetime):
         return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    if isinstance(value, str):
+        text = value.strip()
+        for date_format in ("%m/%d/%Y", "%-m/%-d/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, date_format)
+            except ValueError:
+                continue
     return value
 
 
@@ -327,6 +358,23 @@ def _append_text(existing, addition: str) -> str:
     if not current:
         return addition
     return f"{current}\n{addition}"
+
+
+def _join_remarks(existing: str | None, addition: str) -> str:
+    return f"{existing}\n{addition}" if existing else addition
+
+
+def _date_change_remark(run_label: str | None, old_display: str, new_display: str) -> str:
+    prefix = f"[{run_label}] " if run_label else ""
+    return f"{prefix}ARRIVAL_DATE_CHANGED: {old_display or '(blank)'} -> {new_display}"
+
+
+def _display_cell_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return _display_date(value)
+    return str(value).strip()
 
 
 def _find_header_row(sheet) -> tuple[int, list[str]]:
@@ -364,7 +412,8 @@ param(
     [Parameter(Mandatory=$true)][string]$WorkbookPath,
     [Parameter(Mandatory=$true)][string]$OutputPath,
     [Parameter(Mandatory=$false)][string]$SheetName,
-    [Parameter(Mandatory=$true)][string]$PayloadPath
+    [Parameter(Mandatory=$true)][string]$PayloadPath,
+    [Parameter(Mandatory=$false)][string]$RunLabel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -426,6 +475,23 @@ function Find-Header($sheet, [int]$maxCol) {
     throw 'Could not find expected header row.'
 }
 
+function Display-Date([object]$value) {
+    if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) { return '' }
+    if ($value -is [datetime]) { return $value.ToString('M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture) }
+    try {
+        if ($value -is [double] -or $value -is [int]) {
+            return ([datetime]::FromOADate([double]$value)).ToString('M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+        }
+    } catch {}
+    return ([string]$value).Trim()
+}
+
+function Append-Remark([string]$existing, [string]$addition) {
+    if ([string]::IsNullOrWhiteSpace($addition)) { return $existing }
+    if ([string]::IsNullOrWhiteSpace($existing)) { return $addition }
+    return $existing + [Environment]::NewLine + $addition
+}
+
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
@@ -473,18 +539,30 @@ try {
         }
 
         $rowChanged = $false
+        $remark = [string]$item.remark
         if ($item.found -and -not [string]::IsNullOrWhiteSpace([string]$item.arrival_date)) {
             $arrivalCell = $sheet.Cells.Item($row, $arrivalCol)
             $arrivalDate = [datetime]::ParseExact([string]$item.arrival_date, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
-            $arrivalCell.Value2 = $arrivalDate.ToOADate()
-            $arrivalCell.NumberFormat = 'm/d/yyyy'
-            $arrivalCell.Interior.Color = 13431551
-            $rowChanged = $true
+            $oldDisplay = Display-Date $arrivalCell.Value2
+            $newDisplay = $arrivalDate.ToString('M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+            if ($oldDisplay -ne $newDisplay) {
+                $arrivalCell.Value2 = $arrivalDate.ToOADate()
+                $arrivalCell.NumberFormat = 'm/d/yyyy'
+                $arrivalCell.Interior.Color = 13431551
+                $prefix = ''
+                if (-not [string]::IsNullOrWhiteSpace($RunLabel)) {
+                    $prefix = '[' + $RunLabel + '] '
+                }
+                if ([string]::IsNullOrWhiteSpace($oldDisplay)) {
+                    $oldDisplay = '(blank)'
+                }
+                $remark = Append-Remark $remark ($prefix + 'ARRIVAL_DATE_CHANGED: ' + $oldDisplay + ' -> ' + $newDisplay)
+                $rowChanged = $true
+            }
         }
 
-        if (-not [string]::IsNullOrWhiteSpace([string]$item.remark)) {
+        if (-not [string]::IsNullOrWhiteSpace($remark)) {
             $remarkCell = $sheet.Cells.Item($row, $exceptionCol)
-            $remark = [string]$item.remark
             $existing = ([string]$remarkCell.Text).Trim()
             if ([string]::IsNullOrWhiteSpace($existing)) {
                 $remarkCell.Value2 = $remark

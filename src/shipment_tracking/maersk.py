@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+import re
 from typing import Any
 from urllib import parse, request
 
@@ -14,6 +15,8 @@ from .time_utils import to_china_naive
 DEFAULT_TOKEN_URL = "https://api.maersk.com/customer-identity/oauth/v2/access_token"
 DEFAULT_API_BASE_URL = "https://api.maersk.com/track-and-trace-private"
 DEFAULT_EVENTS_PATH = "/events"
+QUERY_TYPES = ("transportDocumentReference", "carrierBookingReference", "equipmentReference")
+CONTAINER_RE = re.compile(r"^[A-Z]{4}\d{7}$")
 
 
 @dataclass(frozen=True)
@@ -110,16 +113,31 @@ class MaerskClient:
         self.events_path = events_path or os.getenv("MAERSK_EVENTS_PATH", DEFAULT_EVENTS_PATH)
         self.timeout = timeout
         self._access_token: str | None = None
+        self._successful_query_type_by_kind: dict[str, str] = {}
 
     def track(self, reference: str) -> MaerskTrackingResult:
         last_result: MaerskTrackingResult | None = None
-        for query_type in ("transportDocumentReference", "carrierBookingReference", "equipmentReference"):
+        reference = reference.strip()
+        kind = _reference_kind(reference)
+        for query_type in self._query_order(reference):
             result = self.track_by(reference, query_type)
             if result.found:
+                self._successful_query_type_by_kind[kind] = query_type
                 return result
             last_result = result
         assert last_result is not None
         return last_result
+
+    def _query_order(self, reference: str) -> tuple[str, ...]:
+        kind = _reference_kind(reference)
+        learned = self._successful_query_type_by_kind.get(kind)
+        if learned:
+            return _prefer(learned, QUERY_TYPES)
+        if kind == "container":
+            return ("equipmentReference", "transportDocumentReference", "carrierBookingReference")
+        if kind == "numeric":
+            return ("carrierBookingReference", "transportDocumentReference", "equipmentReference")
+        return QUERY_TYPES
 
     def track_by(self, reference: str, query_type: str) -> MaerskTrackingResult:
         params = parse.urlencode({query_type: reference.strip()})
@@ -302,3 +320,16 @@ def _latest_classifier(events: list[dict[str, Any]]) -> str | None:
     event, _ = max(dated, key=lambda item: item[1])
     parts = [event.get("eventType"), event.get("transportEventTypeCode") or event.get("equipmentEventTypeCode") or event.get("shipmentEventTypeCode"), event.get("eventClassifierCode")]
     return ":".join(str(part) for part in parts if part)
+
+
+def _reference_kind(reference: str) -> str:
+    clean = reference.strip().upper().replace(" ", "")
+    if CONTAINER_RE.match(clean):
+        return "container"
+    if clean.isdigit():
+        return "numeric"
+    return "other"
+
+
+def _prefer(first: str, values: tuple[str, ...]) -> tuple[str, ...]:
+    return (first, *(value for value in values if value != first))

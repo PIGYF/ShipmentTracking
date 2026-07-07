@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import socket
@@ -27,6 +28,17 @@ PENDING_STATUS = "\u672a\u9001\u8d27"
 LOG_FILENAME = "refresh.log"
 ENABLED_CARRIERS = {"DGF", "MAERSK"}
 _log_path: Path | None = None
+_run_label: str = ""
+
+
+@dataclass
+class CarrierStats:
+    queried: int = 0
+    found: int = 0
+    not_found: int = 0
+    no_arrival_date: int = 0
+    error: int = 0
+    skipped: int = 0
 
 
 def main() -> None:
@@ -42,6 +54,7 @@ def main() -> None:
     source = Path(args.excel_path)
     output = Path(args.output) if args.output else source
     _init_log(output)
+    run_started = time.monotonic()
     _emit(f"Workbook: {source}")
     _emit(f"Sheet: {args.sheet}")
     _emit(f"Output: {output}")
@@ -56,20 +69,23 @@ def main() -> None:
     counts = Counter(carrier for carrier, _ in unique_jobs)
     _emit(f"Loaded pending supported rows: {len(rows)}")
     _emit("Unique API queries: " + ", ".join(f"{carrier}={count}" for carrier, count in sorted(counts.items())) if counts else "Unique API queries: 0")
+    _emit_carrier_query_counts(counts)
 
     if args.dry_run:
         for index, (carrier, tracking_number) in enumerate(unique_jobs, start=1):
             _emit(f"[DRY-RUN] {index}/{len(unique_jobs)} {carrier} {tracking_number}")
         return
 
-    records, remarks = _run_jobs_by_carrier(unique_jobs)
+    records, remarks, stats = _run_jobs_by_carrier(unique_jobs)
 
-    updated = update_tracking_workbook(source, records, output, args.sheet, remarks)
+    updated = update_tracking_workbook(source, records, output, args.sheet, remarks, run_label=_run_label)
+    _emit_carrier_result_counts(stats)
     _emit(f"Updated rows: {updated}")
     _emit(f"Saved: {output}")
+    _emit(f"Elapsed: {_format_elapsed(time.monotonic() - run_started)}")
 
 
-def _run_jobs_by_carrier(unique_jobs: list[tuple[str, str]]) -> tuple[list[TrackingRecord], dict[str, str]]:
+def _run_jobs_by_carrier(unique_jobs: list[tuple[str, str]]) -> tuple[list[TrackingRecord], dict[str, str], dict[str, CarrierStats]]:
     grouped: dict[str, list[str]] = {carrier: [] for carrier in sorted(ENABLED_CARRIERS)}
     for carrier, tracking_number in unique_jobs:
         grouped.setdefault(carrier, []).append(tracking_number)
@@ -77,6 +93,7 @@ def _run_jobs_by_carrier(unique_jobs: list[tuple[str, str]]) -> tuple[list[Track
     active_groups = {carrier: jobs for carrier, jobs in grouped.items() if jobs}
     records: list[TrackingRecord] = []
     remarks: dict[str, str] = {}
+    stats: dict[str, CarrierStats] = {}
 
     with ThreadPoolExecutor(max_workers=len(active_groups) or 1) as executor:
         futures = {
@@ -85,44 +102,50 @@ def _run_jobs_by_carrier(unique_jobs: list[tuple[str, str]]) -> tuple[list[Track
         }
         for future in as_completed(futures):
             carrier = futures[future]
-            carrier_records, carrier_remarks = future.result()
+            carrier_records, carrier_remarks, carrier_stats = future.result()
             records.extend(carrier_records)
             remarks.update(carrier_remarks)
+            stats[carrier] = carrier_stats
             total = len(active_groups[carrier])
             _emit(f"[{carrier}] completed {total}/{total}")
 
-    return records, remarks
+    return records, remarks, stats
 
 
-def _run_carrier_jobs(carrier: str, tracking_numbers: list[str]) -> tuple[list[TrackingRecord], dict[str, str]]:
+def _run_carrier_jobs(carrier: str, tracking_numbers: list[str]) -> tuple[list[TrackingRecord], dict[str, str], CarrierStats]:
     records: list[TrackingRecord] = []
     remarks: dict[str, str] = {}
+    stats = CarrierStats(queried=len(tracking_numbers))
     total = len(tracking_numbers)
     try:
         client = _client_for(carrier)
     except RuntimeError as exc:
-        skipped = f"SKIPPED: {exc}"
+        skipped = _dated_remark(f"SKIPPED: {exc}")
         for tracking_number in tracking_numbers:
             remarks[tracking_number] = skipped
+        stats.skipped = total
         _emit(f"[{carrier}] skipped {total}/{total}: {exc}")
-        return records, remarks
+        return records, remarks, stats
 
     for index, tracking_number in enumerate(tracking_numbers, start=1):
         try:
             record = _track(client, carrier, tracking_number)
             records.append(record)
-            remark = _remark(record) or _success_remark(record)
+            _update_stats(stats, record)
+            remark = _remark(record)
             if remark:
-                remarks[tracking_number] = remark
+                remarks[tracking_number] = _dated_remark(remark)
             _emit(_progress_line(index, total, record, remark))
         except Exception as exc:
-            error = _format_error(exc)
+            stats.error += 1
+            error = _dated_remark(_format_error(exc))
             remarks[tracking_number] = error
             _emit(f"[{carrier}] {index}/{total} {tracking_number} -> {error}")
             if _should_stop_carrier(exc):
                 skipped = tracking_numbers[index:]
                 for skipped_tracking_number in skipped:
-                    remarks[skipped_tracking_number] = f"SKIPPED: {carrier} query stopped after connection/configuration error"
+                    remarks[skipped_tracking_number] = _dated_remark(f"SKIPPED: {carrier} query stopped after connection/configuration error")
+                stats.skipped += len(skipped)
                 if skipped:
                     _emit(
                         f"[{carrier}] stopped after API connection/configuration error; "
@@ -133,7 +156,7 @@ def _run_carrier_jobs(carrier: str, tracking_numbers: list[str]) -> tuple[list[T
         if carrier == "DGF" and index < total:
             time.sleep(6)
 
-    return records, remarks
+    return records, remarks, stats
 
 
 def _client_for(carrier: str):
@@ -216,21 +239,6 @@ def _remark(record: TrackingRecord) -> str | None:
     return None
 
 
-def _success_remark(record: TrackingRecord) -> str:
-    parts = [record.carrier, "FOUND"]
-    if record.arrival_date:
-        parts.append(f"{record.arrival_date_type or 'ARRIVAL'} {_format_date(record.arrival_date)}")
-    if record.status_description:
-        parts.append(record.status_description)
-    elif record.status:
-        parts.append(record.status)
-    return ": ".join((parts[0], " | ".join(parts[1:])))
-
-
-def _format_date(value) -> str:
-    return f"{value.month}/{value.day}/{value.year}"
-
-
 def _progress_line(index: int, total: int, record: TrackingRecord, remark: str | None) -> str:
     if remark:
         result = remark
@@ -245,6 +253,49 @@ def _format_error(exc: Exception) -> str:
     return f"ERROR: {type(exc).__name__}: {exc}"
 
 
+def _update_stats(stats: CarrierStats, record: TrackingRecord) -> None:
+    if not record.found:
+        stats.not_found += 1
+    else:
+        stats.found += 1
+        if not record.arrival_date:
+            stats.no_arrival_date += 1
+
+
+def _dated_remark(message: str) -> str:
+    return f"[{_run_label}] {message}" if _run_label else message
+
+
+def _emit_carrier_query_counts(counts: Counter[str]) -> None:
+    _emit("Carrier query counts:")
+    if not counts:
+        _emit("  none")
+        return
+    for carrier in sorted(counts):
+        _emit(f"  {carrier}: {counts[carrier]}")
+
+
+def _emit_carrier_result_counts(stats: dict[str, CarrierStats]) -> None:
+    _emit("Carrier results:")
+    if not stats:
+        _emit("  none")
+        return
+    for carrier in sorted(stats):
+        item = stats[carrier]
+        _emit(
+            f"  {carrier}: queried={item.queried}, found={item.found}, "
+            f"not_found={item.not_found}, no_arrival_date={item.no_arrival_date}, "
+            f"error={item.error}, skipped={item.skipped}"
+        )
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _should_stop_carrier(exc: Exception) -> bool:
     if isinstance(exc, RuntimeError):
         return True
@@ -254,9 +305,10 @@ def _should_stop_carrier(exc: Exception) -> bool:
 
 
 def _init_log(excel_path: Path) -> None:
-    global _log_path
+    global _log_path, _run_label
+    _run_label = datetime.now().strftime("%Y-%m-%d %H:%M")
     _log_path = excel_path.parent / LOG_FILENAME
-    _log_path.write_text(f"Run started: {datetime.now():%Y-%m-%d %H:%M:%S}\n", encoding="utf-8")
+    _log_path.write_text(f"Run started: {_run_label}\n", encoding="utf-8")
 
 
 def _emit(message: str) -> None:
