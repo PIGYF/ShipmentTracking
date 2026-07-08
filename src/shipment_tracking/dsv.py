@@ -37,9 +37,15 @@ class DsvTrackingResult:
             )
 
         events = shipment.get("events") if isinstance(shipment.get("events"), list) else []
+        booking_event = _earliest_event(events, "BOOKING")
+        actual_pickup_event = _latest_event(events, "PCF") or _latest_event(events, "PUP")
+        departure_event = _latest_event(events, "DEP") or _latest_event(events, "ETD")
         actual_arrival_event = _latest_event(events, "ARV")
         eta_arrival_event = _latest_event(events, "ETA")
 
+        call_for_pickup_date = to_china_naive(_parse_datetime(booking_event.get("eventDate")) if booking_event else None)
+        actual_pickup = to_china_naive(_parse_datetime(actual_pickup_event.get("eventDate")) if actual_pickup_event else None)
+        departure_date = to_china_naive(_parse_datetime(departure_event.get("eventDate")) if departure_event else None)
         actual_arrival = to_china_naive(_parse_datetime(actual_arrival_event.get("eventDate")) if actual_arrival_event else None)
         eta_arrival = to_china_naive(_parse_datetime(eta_arrival_event.get("eventDate")) if eta_arrival_event else None)
         arrival_date = actual_arrival or eta_arrival
@@ -56,6 +62,9 @@ class DsvTrackingResult:
             actual_arrival=actual_arrival,
             arrival_date=arrival_date,
             arrival_date_type=arrival_date_type,
+            call_for_pickup_date=call_for_pickup_date,
+            departure_date=departure_date,
+            actual_pickup=actual_pickup,
             origin=_event_location(_latest_event(events, "DEP") or _latest_event(events, "ETD") or {}),
             destination=_event_location(arrival_event),
             house_bill=self.query,
@@ -191,6 +200,19 @@ def _latest_event(events: list[Any], code: str) -> dict[str, Any] | None:
     if not matches:
         return None
     return max(matches, key=lambda event: _parse_datetime(event.get("eventDate")) or datetime.min)
+
+
+def _earliest_event(events: list[Any], code: str) -> dict[str, Any] | None:
+    matches = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("eventCode") or "").upper() == code
+        and not event.get("cancelled")
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda event: _parse_datetime(event.get("eventDate")) or datetime.max)
 
 
 def _parse_datetime(value: Any) -> datetime | None:

@@ -23,6 +23,9 @@ from .time_utils import date_only
 COL_BILL_NO = "\u63d0\u5355\u53f7"
 COL_FORWARDER = "\u8d27\u4ee3"
 COL_STATUS = "\u72b6\u6001\u663e\u793a"
+COL_CALL_FOR_PICKUP = "\u901a\u77e5\u63d0\u8d27\u65e5\u671f"
+COL_ACTUAL_PICKUP = "\u5b9e\u9645\u63d0\u8d27\u65e5\u671f"
+COL_DEPARTURE = "\u79bb\u6e2f\u65e5\u671f"
 COL_ARRIVAL = "\u5230\u6e2f\u65e5\u671f"
 COL_EXCEPTION = "\u5f02\u5e38\u8bb0\u5f55"
 COL_TRACKING_NOTE = "\u8ffd\u8e2a\u8bb0\u5f55"
@@ -30,6 +33,9 @@ COL_TRACKING_NOTE = "\u8ffd\u8e2a\u8bb0\u5f55"
 COL_BILL_NO_EN = "BILL_NO"
 COL_FORWARDER_EN = "GOODS_YARD"
 COL_STATUS_EN = "DISPLAY_STATUS"
+COL_CALL_FOR_PICKUP_EN = "CALL FOR PICK UP DATE"
+COL_ACTUAL_PICKUP_EN = "ACTUAL PICK UP DATE"
+COL_DEPARTURE_EN = "DEPARTURE_DATE"
 COL_ARRIVAL_EN = "ARRIVAL_DATE"
 
 FILL_CHANGED = PatternFill("solid", fgColor="FFF2CC")
@@ -81,6 +87,9 @@ def _update_tracking_workbook_with_openpyxl(
 
     key_col = _require_column(columns, [COL_BILL_NO, COL_BILL_NO_EN, "\u8fd0\u5355", "bl number", "b/l", "house bill", "tracking_number"])
     carrier_col = _find_column(columns, [COL_FORWARDER, COL_FORWARDER_EN, "forwarder", "carrier"])
+    call_for_pickup_col = _require_column(columns, [COL_CALL_FOR_PICKUP, COL_CALL_FOR_PICKUP_EN])
+    actual_pickup_col = _require_column(columns, [COL_ACTUAL_PICKUP, COL_ACTUAL_PICKUP_EN])
+    departure_col = _require_column(columns, [COL_DEPARTURE, COL_DEPARTURE_EN])
     arrival_col = _require_column(columns, [COL_ARRIVAL, COL_ARRIVAL_EN])
     tracking_note_col = _require_column(columns, [COL_TRACKING_NOTE])
 
@@ -102,6 +111,39 @@ def _update_tracking_workbook_with_openpyxl(
 
         row_changed = False
         if record and record.found:
+            row_changed, remark = _update_record_date_cell(
+                sheet,
+                row,
+                call_for_pickup_col,
+                record.call_for_pickup_date,
+                record,
+                "CALL_FOR_PICKUP_DATE",
+                run_label,
+                remark,
+                row_changed,
+            )
+            row_changed, remark = _update_record_date_cell(
+                sheet,
+                row,
+                actual_pickup_col,
+                record.actual_pickup,
+                record,
+                "ACTUAL_PICKUP_DATE",
+                run_label,
+                remark,
+                row_changed,
+            )
+            row_changed, remark = _update_record_date_cell(
+                sheet,
+                row,
+                departure_col,
+                record.departure_date,
+                record,
+                "DEPARTURE_DATE",
+                run_label,
+                remark,
+                row_changed,
+            )
             if record.arrival_date:
                 changed, old_display, new_display = _set_date_if_changed(
                     sheet.cell(row=row, column=arrival_col),
@@ -208,6 +250,9 @@ def _excel_com_payload(records: list[TrackingRecord], remarks: dict[str, str]) -
                 "found": record.found if record else False,
                 "arrival_date": _display_date(record.arrival_date) if record and record.arrival_date else None,
                 "arrival_date_type": record.arrival_date_type if record else None,
+                "call_for_pickup_date": _display_date(record.call_for_pickup_date) if record and record.call_for_pickup_date else None,
+                "actual_pickup": _display_date(record.actual_pickup) if record and record.actual_pickup else None,
+                "departure_date": _display_date(record.departure_date) if record and record.departure_date else None,
                 "remark": remarks.get(tracking_number),
             }
         )
@@ -377,6 +422,37 @@ def _set_date_if_changed(cell, new_value, date_format: str | None = None) -> tup
     return True, old_display, new_display
 
 
+def _update_record_date_cell(
+    sheet,
+    row: int,
+    column: int,
+    value: datetime | None,
+    record: TrackingRecord,
+    field_label: str,
+    run_label: str | None,
+    remark: str | None,
+    row_changed: bool,
+) -> tuple[bool, str | None]:
+    if not value:
+        return row_changed, remark
+    changed, old_display, new_display = _set_date_if_changed(
+        sheet.cell(row=row, column=column),
+        date_only(value),
+        date_format="m/d/yyyy",
+    )
+    if changed:
+        change_remark = _date_field_change_remark(
+            run_label,
+            record.carrier,
+            field_label,
+            old_display,
+            new_display,
+        )
+        remark = _join_remarks(remark, change_remark)
+        row_changed = True
+    return row_changed, remark
+
+
 def _normalize_cell_value(value):
     if isinstance(value, datetime):
         return value.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -412,6 +488,18 @@ def _date_change_remark(
     carrier_label = f"{carrier}: " if carrier else ""
     type_label = f"{arrival_date_type or 'ARRIVAL'} "
     return f"{prefix}{carrier_label}{type_label}ARRIVAL_DATE_CHANGED: {old_display or '(blank)'} -> {new_display}"
+
+
+def _date_field_change_remark(
+    run_label: str | None,
+    carrier: str | None,
+    field_label: str,
+    old_display: str,
+    new_display: str,
+) -> str:
+    prefix = f"[{run_label}] " if run_label else ""
+    carrier_label = f"{carrier}: " if carrier else ""
+    return f"{prefix}{carrier_label}{field_label}_CHANGED: {old_display or '(blank)'} -> {new_display}"
 
 
 def _actual_arrival_confirmation_remark(run_label: str | None, carrier: str | None, arrival_display: str) -> str:
@@ -546,7 +634,31 @@ function Display-Date([object]$value) {
 function Append-Remark([string]$existing, [string]$addition) {
     if ([string]::IsNullOrWhiteSpace($addition)) { return $existing }
     if ([string]::IsNullOrWhiteSpace($existing)) { return $addition }
-    return $existing + [Environment]::NewLine + $addition
+    return $existing + "`n" + $addition
+}
+
+function Update-Date-Cell($cell, [string]$dateText, [string]$carrierLabel, [string]$fieldLabel, [string]$runLabel, [string]$remark) {
+    if ([string]::IsNullOrWhiteSpace($dateText)) {
+        return @{ Changed = $false; Remark = $remark }
+    }
+    $newDate = [datetime]::ParseExact($dateText, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+    $oldDisplay = Display-Date $cell.Value2
+    $newDisplay = $newDate.ToString('M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+    if ($oldDisplay -eq $newDisplay) {
+        return @{ Changed = $false; Remark = $remark }
+    }
+    $cell.NumberFormat = 'm/d/yyyy'
+    $cell.Value = $newDisplay
+    $cell.Interior.Color = 13431551
+    $prefix = ''
+    if (-not [string]::IsNullOrWhiteSpace($runLabel)) {
+        $prefix = '[' + $runLabel + '] '
+    }
+    if ([string]::IsNullOrWhiteSpace($oldDisplay)) {
+        $oldDisplay = '(blank)'
+    }
+    $newRemark = Append-Remark $remark ($prefix + $carrierLabel + $fieldLabel + '_CHANGED: ' + $oldDisplay + ' -> ' + $newDisplay)
+    return @{ Changed = $true; Remark = $newRemark }
 }
 
 $excel = New-Object -ComObject Excel.Application
@@ -581,11 +693,17 @@ try {
 
     $keyCol = Find-Column $headers @('提单号', 'BILL_NO', '运单', 'bl number', 'b/l', 'house bill', 'tracking_number') $true
     $carrierCol = Find-Column $headers @('货代', 'GOODS_YARD', 'forwarder', 'carrier') $true
+    $callForPickupCol = Find-Column $headers @('通知提货日期', 'CALL FOR PICK UP DATE') $false
+    $actualPickupCol = Find-Column $headers @('实际提货日期', 'ACTUAL PICK UP DATE') $false
+    $departureCol = Find-Column $headers @('离港日期', 'DEPARTURE_DATE') $false
     $arrivalCol = Find-Column $headers @('到港日期', 'ARRIVAL_DATE') $false
     $trackingNoteCol = Find-Column $headers @('追踪记录') $false
 
     if ($null -eq $keyCol -or $null -eq $arrivalCol) {
         throw 'Missing required 提单号/BILL_NO or 到港日期/ARRIVAL_DATE column.'
+    }
+    if ($null -eq $callForPickupCol -or $null -eq $actualPickupCol -or $null -eq $departureCol) {
+        throw 'Missing required 通知提货日期/CALL FOR PICK UP DATE, 实际提货日期/ACTUAL PICK UP DATE, or 离港日期/DEPARTURE_DATE column.'
     }
     if ($null -eq $trackingNoteCol) {
         throw 'Missing required 追踪记录 column.'
@@ -606,6 +724,21 @@ try {
 
         $rowChanged = $false
         $remark = [string]$item.remark
+        if ($item.found) {
+            $carrierLabel = ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$item.carrier)) {
+                $carrierLabel = [string]$item.carrier + ': '
+            }
+            $dateResult = Update-Date-Cell $sheet.Cells.Item($row, $callForPickupCol) ([string]$item.call_for_pickup_date) $carrierLabel 'CALL_FOR_PICKUP_DATE' $RunLabel $remark
+            $remark = [string]$dateResult.Remark
+            if ($dateResult.Changed) { $rowChanged = $true }
+            $dateResult = Update-Date-Cell $sheet.Cells.Item($row, $actualPickupCol) ([string]$item.actual_pickup) $carrierLabel 'ACTUAL_PICKUP_DATE' $RunLabel $remark
+            $remark = [string]$dateResult.Remark
+            if ($dateResult.Changed) { $rowChanged = $true }
+            $dateResult = Update-Date-Cell $sheet.Cells.Item($row, $departureCol) ([string]$item.departure_date) $carrierLabel 'DEPARTURE_DATE' $RunLabel $remark
+            $remark = [string]$dateResult.Remark
+            if ($dateResult.Changed) { $rowChanged = $true }
+        }
         if ($item.found -and -not [string]::IsNullOrWhiteSpace([string]$item.arrival_date)) {
             $arrivalCell = $sheet.Cells.Item($row, $arrivalCol)
             $arrivalDate = [datetime]::ParseExact([string]$item.arrival_date, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
@@ -647,7 +780,7 @@ try {
             if ([string]::IsNullOrWhiteSpace($existing)) {
                 $remarkCell.Value2 = $remark
             } else {
-                $remarkCell.Value2 = $existing + [Environment]::NewLine + $remark
+                $remarkCell.Value2 = $existing + "`n" + $remark
             }
             if ($remark.StartsWith('ERROR') -or $remark.StartsWith('NOT_FOUND')) {
                 $remarkCell.Interior.Color = 13421823

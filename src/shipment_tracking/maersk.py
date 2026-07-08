@@ -63,10 +63,14 @@ class MaerskTrackingResult:
         eta_arrival_event = _transport_arrival_at_sequence(events, "EST", final_sequence)
         actual_arrival_event = _transport_arrival_at_sequence(events, "ACT", final_sequence)
         actual_discharge_event = _equipment_discharge_at_sequence(events, final_sequence)
+        actual_pickup_event = _first_equipment_event(events, "GTIN", "ACT")
+        departure_event = _origin_departure_event(events)
 
         eta_arrival = to_china_naive(_parse_datetime(eta_arrival_event.get("eventDateTime")) if eta_arrival_event else None)
         actual_arrival = to_china_naive(_parse_datetime(actual_arrival_event.get("eventDateTime")) if actual_arrival_event else None)
         fallback_discharge = to_china_naive(_parse_datetime(actual_discharge_event.get("eventDateTime")) if actual_discharge_event else None)
+        actual_pickup = to_china_naive(_parse_datetime(actual_pickup_event.get("eventDateTime")) if actual_pickup_event else None)
+        departure_date = to_china_naive(_parse_datetime(departure_event.get("eventDateTime")) if departure_event else None)
         arrival_date = actual_arrival or eta_arrival or fallback_discharge
         arrival_date_type = "ACTUAL" if actual_arrival or fallback_discharge else "ESTIMATED" if eta_arrival else None
 
@@ -83,6 +87,8 @@ class MaerskTrackingResult:
             actual_arrival=actual_arrival or fallback_discharge,
             arrival_date=arrival_date,
             arrival_date_type=arrival_date_type,
+            departure_date=departure_date,
+            actual_pickup=actual_pickup,
             destination=_transport_location(transport_call),
             master_bill=self.query if self.query_type == "transportDocumentReference" else None,
             container_numbers=_reference_values(events, "EQ"),
@@ -262,10 +268,57 @@ def _equipment_discharge_at_sequence(events: list[dict[str, Any]], sequence: int
     return _final_event_by_sequence(candidates)
 
 
+def _first_equipment_event(events: list[dict[str, Any]], event_type_code: str, classifier: str) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event.get("eventType") == "EQUIPMENT"
+        and event.get("equipmentEventTypeCode") == event_type_code
+        and event.get("eventClassifierCode") == classifier
+    ]
+    return _first_event_by_datetime(candidates)
+
+
+def _origin_departure_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    actual = _origin_transport_departure(events, "ACT")
+    if actual:
+        return actual
+    return _origin_transport_departure(events, "EST")
+
+
+def _origin_transport_departure(events: list[dict[str, Any]], classifier: str) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event.get("eventType") == "TRANSPORT"
+        and event.get("transportEventTypeCode") == "DEPA"
+        and event.get("eventClassifierCode") == classifier
+        and _sequence(event) >= 2
+    ]
+    if not candidates:
+        candidates = [
+            event
+            for event in events
+            if event.get("eventType") == "TRANSPORT"
+            and event.get("transportEventTypeCode") == "DEPA"
+            and event.get("eventClassifierCode") == classifier
+        ]
+    return _first_event_by_datetime(candidates)
+
+
 def _final_event_by_sequence(events: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not events:
         return None
     return max(events, key=lambda event: (_sequence(event), _parse_datetime(event.get("eventDateTime")) or datetime.min))
+
+
+def _first_event_by_datetime(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    dated = [(event, _parse_datetime(event.get("eventDateTime"))) for event in events]
+    dated = [(event, value) for event, value in dated if value]
+    if not dated:
+        return None
+    event, _ = min(dated, key=lambda item: item[1])
+    return event
 
 
 def _sequence(event: dict[str, Any]) -> int:

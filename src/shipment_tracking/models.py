@@ -16,6 +16,7 @@ class TrackingRecord:
     actual_arrival: datetime | None = None
     arrival_date: datetime | None = None
     arrival_date_type: str | None = None
+    call_for_pickup_date: datetime | None = None
     departure_date: datetime | None = None
     actual_pickup: datetime | None = None
     actual_delivery: datetime | None = None
