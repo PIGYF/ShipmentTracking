@@ -107,8 +107,21 @@ def _update_tracking_workbook_with_openpyxl(
                 )
                 row_changed |= changed
                 if changed:
-                    change_remark = _date_change_remark(run_label, old_display, new_display)
+                    change_remark = _date_change_remark(
+                        run_label,
+                        record.carrier,
+                        record.arrival_date_type,
+                        old_display,
+                        new_display,
+                    )
                     remark = _join_remarks(remark, change_remark)
+                elif _is_actual_arrival(record.arrival_date_type):
+                    confirm_remark = _actual_arrival_confirmation_remark(
+                        run_label,
+                        record.carrier,
+                        new_display,
+                    )
+                    remark = _join_remarks(remark, confirm_remark)
 
         if remark:
             cell = sheet.cell(row=row, column=exception_col)
@@ -124,8 +137,8 @@ def _update_tracking_workbook_with_openpyxl(
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
     workbook.close()
-    _restore_unmanaged_package_parts(preserve_source, output)
     gc.collect()
+    _restore_unmanaged_package_parts(preserve_source, output)
     if temp_preserve and temp_preserve.exists():
         _unlink_with_retry(temp_preserve, raise_on_failure=False)
     return updated
@@ -191,6 +204,7 @@ def _excel_com_payload(records: list[TrackingRecord], remarks: dict[str, str]) -
                 "carrier": record.carrier if record else None,
                 "found": record.found if record else False,
                 "arrival_date": _display_date(record.arrival_date) if record and record.arrival_date else None,
+                "arrival_date_type": record.arrival_date_type if record else None,
                 "remark": remarks.get(tracking_number),
             }
         )
@@ -364,9 +378,27 @@ def _join_remarks(existing: str | None, addition: str) -> str:
     return f"{existing}\n{addition}" if existing else addition
 
 
-def _date_change_remark(run_label: str | None, old_display: str, new_display: str) -> str:
+def _date_change_remark(
+    run_label: str | None,
+    carrier: str | None,
+    arrival_date_type: str | None,
+    old_display: str,
+    new_display: str,
+) -> str:
     prefix = f"[{run_label}] " if run_label else ""
-    return f"{prefix}ARRIVAL_DATE_CHANGED: {old_display or '(blank)'} -> {new_display}"
+    carrier_label = f"{carrier}: " if carrier else ""
+    type_label = f"{arrival_date_type or 'ARRIVAL'} "
+    return f"{prefix}{carrier_label}{type_label}ARRIVAL_DATE_CHANGED: {old_display or '(blank)'} -> {new_display}"
+
+
+def _actual_arrival_confirmation_remark(run_label: str | None, carrier: str | None, arrival_display: str) -> str:
+    prefix = f"[{run_label}] " if run_label else ""
+    carrier_label = f"{carrier}: " if carrier else ""
+    return f"{prefix}{carrier_label}ACTUAL ARRIVAL_CONFIRMED: {arrival_display}"
+
+
+def _is_actual_arrival(arrival_date_type: str | None) -> bool:
+    return str(arrival_date_type or "").upper() == "ACTUAL"
 
 
 def _display_cell_value(value) -> str:
@@ -545,6 +577,14 @@ try {
             $arrivalDate = [datetime]::ParseExact([string]$item.arrival_date, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
             $oldDisplay = Display-Date $arrivalCell.Value2
             $newDisplay = $arrivalDate.ToString('M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+            $carrierLabel = ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$item.carrier)) {
+                $carrierLabel = [string]$item.carrier + ': '
+            }
+            $typeLabel = [string]$item.arrival_date_type
+            if ([string]::IsNullOrWhiteSpace($typeLabel)) {
+                $typeLabel = 'ARRIVAL'
+            }
             if ($oldDisplay -ne $newDisplay) {
                 $arrivalCell.Value2 = $arrivalDate.ToOADate()
                 $arrivalCell.NumberFormat = 'm/d/yyyy'
@@ -556,8 +596,14 @@ try {
                 if ([string]::IsNullOrWhiteSpace($oldDisplay)) {
                     $oldDisplay = '(blank)'
                 }
-                $remark = Append-Remark $remark ($prefix + 'ARRIVAL_DATE_CHANGED: ' + $oldDisplay + ' -> ' + $newDisplay)
+                $remark = Append-Remark $remark ($prefix + $carrierLabel + $typeLabel + ' ARRIVAL_DATE_CHANGED: ' + $oldDisplay + ' -> ' + $newDisplay)
                 $rowChanged = $true
+            } elseif ($typeLabel.ToUpperInvariant() -eq 'ACTUAL') {
+                $prefix = ''
+                if (-not [string]::IsNullOrWhiteSpace($RunLabel)) {
+                    $prefix = '[' + $RunLabel + '] '
+                }
+                $remark = Append-Remark $remark ($prefix + $carrierLabel + 'ACTUAL ARRIVAL_CONFIRMED: ' + $newDisplay)
             }
         }
 

@@ -18,7 +18,7 @@ if __package__ in {None, ""}:
 
 from shipment_tracking.dgf import DgfClient
 from shipment_tracking.env import load_dotenv
-from shipment_tracking.excel_writer import COL_BILL_NO, COL_FORWARDER, COL_STATUS, update_tracking_workbook
+from shipment_tracking.excel_writer import COL_BILL_NO, COL_EXCEPTION, COL_FORWARDER, COL_STATUS, update_tracking_workbook
 from shipment_tracking.maersk import MaerskClient
 from shipment_tracking.models import TrackingRecord
 
@@ -176,8 +176,10 @@ def _load_pending_supported_rows(path: Path, sheet_name: str) -> list[tuple[str,
         bill_idx = _find_column(columns, [COL_BILL_NO])
         carrier_idx = _find_column(columns, [COL_FORWARDER])
         status_idx = _find_column(columns, [COL_STATUS])
+        exception_idx = _find_optional_column(columns, [COL_EXCEPTION])
 
         rows: list[tuple[str, str]] = []
+        skipped_actual_arrival = 0
         for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
             status = str(row[status_idx] or "").strip()
             if status != PENDING_STATUS:
@@ -185,9 +187,15 @@ def _load_pending_supported_rows(path: Path, sheet_name: str) -> list[tuple[str,
             carrier = str(row[carrier_idx] or "").strip().upper()
             if carrier not in ENABLED_CARRIERS:
                 continue
+            exception = row[exception_idx] if exception_idx is not None else None
+            if _has_actual_arrival_remark(carrier, exception):
+                skipped_actual_arrival += 1
+                continue
             tracking_number = str(row[bill_idx] or "").strip()
             if tracking_number:
                 rows.append((carrier, tracking_number))
+        if skipped_actual_arrival:
+            _emit(f"Skipped rows with ACTUAL arrival remark: {skipped_actual_arrival}")
         return rows
     finally:
         workbook.close()
@@ -215,12 +223,30 @@ def _unique_jobs(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 def _find_column(columns: dict[str, int], names: list[str]) -> int:
+    column = _find_optional_column(columns, names)
+    if column is not None:
+        return column
+    raise ValueError(f"Missing required column: {', '.join(names)}")
+
+
+def _find_optional_column(columns: dict[str, int], names: list[str]) -> int | None:
     for name in names:
         needle = name.lower()
         for header, index in columns.items():
             if header == needle or needle in header:
                 return index
-    raise ValueError(f"Missing required column: {', '.join(names)}")
+    return None
+
+
+def _has_actual_arrival_remark(carrier: str, remark_value) -> bool:
+    if remark_value is None:
+        return False
+    carrier = carrier.upper()
+    for line in str(remark_value).splitlines():
+        normalized = line.upper()
+        if carrier in normalized and "ACTUAL" in normalized:
+            return True
+    return False
 
 
 def _track(client, carrier: str, tracking_number: str) -> TrackingRecord:
