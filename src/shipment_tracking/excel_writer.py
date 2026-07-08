@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import gc
 import json
+import locale
 import os
 from pathlib import Path
 import subprocess
@@ -24,6 +25,7 @@ COL_FORWARDER = "\u8d27\u4ee3"
 COL_STATUS = "\u72b6\u6001\u663e\u793a"
 COL_ARRIVAL = "\u5230\u6e2f\u65e5\u671f"
 COL_EXCEPTION = "\u5f02\u5e38\u8bb0\u5f55"
+COL_TRACKING_NOTE = "\u8ffd\u8e2a\u8bb0\u5f55"
 
 COL_BILL_NO_EN = "BILL_NO"
 COL_FORWARDER_EN = "GOODS_YARD"
@@ -45,12 +47,13 @@ def update_tracking_workbook(
 ) -> int:
     records = list(records)
     remarks = remarks or {}
-    if os.name == "nt" and os.getenv("SHIPMENT_TRACKING_USE_EXCEL_COM") == "1":
-        try:
-            return _update_tracking_workbook_with_excel_com(source_path, records, output_path, sheet_name, remarks, run_label)
-        except RuntimeError:
-            pass
+    if _should_use_excel_com():
+        return _update_tracking_workbook_with_excel_com(source_path, records, output_path, sheet_name, remarks, run_label)
     return _update_tracking_workbook_with_openpyxl(source_path, records, output_path, sheet_name, remarks, run_label)
+
+
+def _should_use_excel_com() -> bool:
+    return os.name == "nt" and os.getenv("SHIPMENT_TRACKING_USE_EXCEL_COM", "1") != "0"
 
 
 def _update_tracking_workbook_with_openpyxl(
@@ -79,7 +82,7 @@ def _update_tracking_workbook_with_openpyxl(
     key_col = _require_column(columns, [COL_BILL_NO, COL_BILL_NO_EN, "\u8fd0\u5355", "bl number", "b/l", "house bill", "tracking_number"])
     carrier_col = _find_column(columns, [COL_FORWARDER, COL_FORWARDER_EN, "forwarder", "carrier"])
     arrival_col = _require_column(columns, [COL_ARRIVAL, COL_ARRIVAL_EN])
-    exception_col = _require_column(columns, [COL_EXCEPTION])
+    tracking_note_col = _require_column(columns, [COL_TRACKING_NOTE])
 
     record_map = {record.tracking_number: record for record in records}
     remarks = remarks or {}
@@ -124,7 +127,7 @@ def _update_tracking_workbook_with_openpyxl(
                     remark = _join_remarks(remark, confirm_remark)
 
         if remark:
-            cell = sheet.cell(row=row, column=exception_col)
+            cell = sheet.cell(row=row, column=tracking_note_col)
             cell.value = _append_text(cell.value, remark)
             if remark.startswith("ERROR") or remark.startswith("NOT_FOUND"):
                 cell.fill = FILL_ERROR
@@ -161,7 +164,7 @@ def _update_tracking_workbook_with_excel_com(
         payload_path = temp_path / "payload.json"
         script_path = temp_path / "update_excel.ps1"
         payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        script_path.write_text(_EXCEL_COM_SCRIPT, encoding="utf-8")
+        script_path.write_text(_EXCEL_COM_SCRIPT, encoding="utf-8-sig")
 
         completed = subprocess.run(
             [
@@ -178,18 +181,18 @@ def _update_tracking_workbook_with_excel_com(
                 run_label or "",
             ],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
         )
 
+    stdout = _decode_subprocess_output(completed.stdout)
+    stderr = _decode_subprocess_output(completed.stderr)
     if completed.returncode != 0:
-        details = (completed.stderr or completed.stdout).strip()
+        details = _subprocess_details(stdout, stderr)
         raise RuntimeError(f"Excel COM update failed: {details}")
 
-    for line in completed.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith("UPDATED_ROWS="):
             return int(line.split("=", 1)[1])
-    raise RuntimeError(f"Excel COM update did not report updated rows: {completed.stdout.strip()}")
+    raise RuntimeError(f"Excel COM update did not report updated rows: {_subprocess_details(stdout, stderr)}")
 
 
 def _excel_com_payload(records: list[TrackingRecord], remarks: dict[str, str]) -> list[dict[str, str | bool | None]]:
@@ -213,6 +216,26 @@ def _excel_com_payload(records: list[TrackingRecord], remarks: dict[str, str]) -
 
 def _display_date(value: datetime) -> str:
     return f"{value.month}/{value.day}/{value.year}"
+
+
+def _decode_subprocess_output(value: bytes | None) -> str:
+    if not value:
+        return ""
+    for encoding in ("utf-8", locale.getpreferredencoding(False)):
+        try:
+            return value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def _subprocess_details(stdout: str, stderr: str) -> str:
+    parts = []
+    if stderr.strip():
+        parts.append(f"stderr: {stderr.strip()}")
+    if stdout.strip():
+        parts.append(f"stdout: {stdout.strip()}")
+    return "\n".join(parts) if parts else "(no output)"
 
 
 def _restore_unmanaged_package_parts(source_path: Path, output_path: Path) -> None:
@@ -449,6 +472,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 $payload = Get-Content -Path $PayloadPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $items = @{}
 foreach ($item in $payload) {
@@ -535,7 +560,16 @@ try {
     if ([string]::IsNullOrWhiteSpace($SheetName)) {
         $sheet = $workbook.Worksheets.Item(1)
     } else {
-        $sheet = $workbook.Worksheets.Item($SheetName)
+        $sheet = $null
+        foreach ($candidateSheet in $workbook.Worksheets) {
+            if ([string]$candidateSheet.Name -eq $SheetName) {
+                $sheet = $candidateSheet
+                break
+            }
+        }
+        if ($null -eq $sheet) {
+            throw "Worksheet not found: $SheetName"
+        }
     }
 
     $used = $sheet.UsedRange
@@ -548,13 +582,13 @@ try {
     $keyCol = Find-Column $headers @('提单号', 'BILL_NO', '运单', 'bl number', 'b/l', 'house bill', 'tracking_number') $true
     $carrierCol = Find-Column $headers @('货代', 'GOODS_YARD', 'forwarder', 'carrier') $true
     $arrivalCol = Find-Column $headers @('到港日期', 'ARRIVAL_DATE') $false
-    $exceptionCol = Find-Column $headers @('异常记录') $false
+    $trackingNoteCol = Find-Column $headers @('追踪记录') $false
 
     if ($null -eq $keyCol -or $null -eq $arrivalCol) {
         throw 'Missing required 提单号/BILL_NO or 到港日期/ARRIVAL_DATE column.'
     }
-    if ($null -eq $exceptionCol) {
-        throw 'Missing required 异常记录 column.'
+    if ($null -eq $trackingNoteCol) {
+        throw 'Missing required 追踪记录 column.'
     }
 
     for ($row = $headerRow + 1; $row -le $maxRow; $row++) {
@@ -586,8 +620,8 @@ try {
                 $typeLabel = 'ARRIVAL'
             }
             if ($oldDisplay -ne $newDisplay) {
-                $arrivalCell.Value2 = $arrivalDate.ToOADate()
                 $arrivalCell.NumberFormat = 'm/d/yyyy'
+                $arrivalCell.Value = $newDisplay
                 $arrivalCell.Interior.Color = 13431551
                 $prefix = ''
                 if (-not [string]::IsNullOrWhiteSpace($RunLabel)) {
@@ -608,7 +642,7 @@ try {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($remark)) {
-            $remarkCell = $sheet.Cells.Item($row, $exceptionCol)
+            $remarkCell = $sheet.Cells.Item($row, $trackingNoteCol)
             $existing = ([string]$remarkCell.Text).Trim()
             if ([string]::IsNullOrWhiteSpace($existing)) {
                 $remarkCell.Value2 = $remark
@@ -634,6 +668,12 @@ try {
         $workbook.SaveAs($OutputPath)
     }
     Write-Output "UPDATED_ROWS=$updated"
+}
+catch {
+    $line = $_.InvocationInfo.ScriptLineNumber
+    $message = $_.Exception.Message
+    Write-Error ("Excel COM script failed at line {0}: {1}" -f $line, $message)
+    exit 1
 }
 finally {
     if ($null -ne $workbook) {

@@ -18,11 +18,23 @@ if "%~1"=="" (
 set "PYTHONPATH=%SRC_PATH%"
 
 if exist "%VENV_PY%" (
+  "%VENV_PY%" --version >nul 2>nul
+  if errorlevel 1 (
+    echo Found .venv, but its Python executable is not usable.
+    echo This usually happens when .venv was copied from another computer.
+    echo Recreate it with:
+    echo   rmdir /s /q .venv
+    echo   py -3 -m venv .venv
+    echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
+    echo Falling back to system Python...
+    goto fallback_python
+  )
   "%VENV_PY%" -m shipment_tracking.refresh_excel %*
   call :finish %ERRORLEVEL%
   exit /b %ERRORLEVEL%
 )
 
+:fallback_python
 where py >nul 2>nul
 if %ERRORLEVEL%==0 (
   py -3 -m shipment_tracking.refresh_excel %*

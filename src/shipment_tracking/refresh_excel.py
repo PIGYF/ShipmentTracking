@@ -17,8 +17,16 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from shipment_tracking.dgf import DgfClient
+from shipment_tracking.dsv import DsvClient
 from shipment_tracking.env import load_dotenv
-from shipment_tracking.excel_writer import COL_BILL_NO, COL_EXCEPTION, COL_FORWARDER, COL_STATUS, update_tracking_workbook
+from shipment_tracking.excel_writer import (
+    COL_BILL_NO,
+    COL_EXCEPTION,
+    COL_FORWARDER,
+    COL_STATUS,
+    COL_TRACKING_NOTE,
+    update_tracking_workbook,
+)
 from shipment_tracking.maersk import MaerskClient
 from shipment_tracking.models import TrackingRecord
 
@@ -26,7 +34,7 @@ from shipment_tracking.models import TrackingRecord
 DEFAULT_SHEET = "2026"
 PENDING_STATUS = "\u672a\u9001\u8d27"
 LOG_FILENAME = "refresh.log"
-ENABLED_CARRIERS = {"DGF", "MAERSK"}
+ENABLED_CARRIERS = {"DGF", "DSV", "MAERSK"}
 _log_path: Path | None = None
 _run_label: str = ""
 
@@ -162,6 +170,8 @@ def _run_carrier_jobs(carrier: str, tracking_numbers: list[str]) -> tuple[list[T
 def _client_for(carrier: str):
     if carrier == "DGF":
         return DgfClient()
+    if carrier == "DSV":
+        return DsvClient()
     if carrier == "MAERSK":
         return MaerskClient()
     raise ValueError(f"Unsupported carrier: {carrier}")
@@ -176,6 +186,7 @@ def _load_pending_supported_rows(path: Path, sheet_name: str) -> list[tuple[str,
         bill_idx = _find_column(columns, [COL_BILL_NO])
         carrier_idx = _find_column(columns, [COL_FORWARDER])
         status_idx = _find_column(columns, [COL_STATUS])
+        tracking_note_idx = _find_optional_column(columns, [COL_TRACKING_NOTE])
         exception_idx = _find_optional_column(columns, [COL_EXCEPTION])
 
         rows: list[tuple[str, str]] = []
@@ -187,8 +198,9 @@ def _load_pending_supported_rows(path: Path, sheet_name: str) -> list[tuple[str,
             carrier = str(row[carrier_idx] or "").strip().upper()
             if carrier not in ENABLED_CARRIERS:
                 continue
+            tracking_note = row[tracking_note_idx] if tracking_note_idx is not None else None
             exception = row[exception_idx] if exception_idx is not None else None
-            if _has_actual_arrival_remark(carrier, exception):
+            if _has_actual_arrival_remark(carrier, tracking_note) or _has_actual_arrival_remark(carrier, exception):
                 skipped_actual_arrival += 1
                 continue
             tracking_number = str(row[bill_idx] or "").strip()
@@ -251,6 +263,8 @@ def _has_actual_arrival_remark(carrier: str, remark_value) -> bool:
 
 def _track(client, carrier: str, tracking_number: str) -> TrackingRecord:
     if carrier == "DGF":
+        return client.track(tracking_number).to_record()
+    if carrier == "DSV":
         return client.track(tracking_number).to_record()
     if carrier == "MAERSK":
         return client.track(tracking_number).to_record()
