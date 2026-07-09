@@ -8,6 +8,7 @@ import re
 from typing import Any
 from urllib import parse, request
 
+from .destination import destination_aliases, matches_destination
 from .models import TrackingRecord
 from .time_utils import to_china_naive
 
@@ -59,10 +60,11 @@ class MaerskTrackingResult:
                 raw={"payload": self.payload} if isinstance(self.payload, dict) else {},
             )
 
-        final_sequence = _final_arrival_sequence(events)
-        eta_arrival_event = _transport_arrival_at_sequence(events, "EST", final_sequence)
-        actual_arrival_event = _transport_arrival_at_sequence(events, "ACT", final_sequence)
-        actual_discharge_event = _equipment_discharge_at_sequence(events, final_sequence)
+        aliases = destination_aliases()
+        destination_sequence = _destination_arrival_sequence(events, aliases)
+        eta_arrival_event = _transport_arrival_at_sequence(events, "EST", destination_sequence)
+        actual_arrival_event = _transport_arrival_at_sequence(events, "ACT", destination_sequence)
+        actual_discharge_event = _equipment_discharge_at_sequence(events, destination_sequence)
         actual_pickup_event = _first_equipment_event(events, "GTIN", "ACT")
         departure_event = _origin_departure_event(events)
 
@@ -230,11 +232,12 @@ def _events(payload: Any) -> list[dict[str, Any]]:
     return found
 
 
-def _final_arrival_sequence(events: list[dict[str, Any]]) -> int:
+def _destination_arrival_sequence(events: list[dict[str, Any]], aliases: tuple[str, ...]) -> int:
     sequences = [
         _sequence(event)
         for event in events
         if event.get("eventType") == "TRANSPORT" and event.get("transportEventTypeCode") == "ARRI"
+        and matches_destination(event.get("transportCall"), aliases)
     ]
     valid = [sequence for sequence in sequences if sequence >= 0]
     return max(valid) if valid else -1
@@ -293,16 +296,7 @@ def _origin_transport_departure(events: list[dict[str, Any]], classifier: str) -
         if event.get("eventType") == "TRANSPORT"
         and event.get("transportEventTypeCode") == "DEPA"
         and event.get("eventClassifierCode") == classifier
-        and _sequence(event) >= 2
     ]
-    if not candidates:
-        candidates = [
-            event
-            for event in events
-            if event.get("eventType") == "TRANSPORT"
-            and event.get("transportEventTypeCode") == "DEPA"
-            and event.get("eventClassifierCode") == classifier
-        ]
     return _first_event_by_datetime(candidates)
 
 

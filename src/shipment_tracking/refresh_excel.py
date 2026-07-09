@@ -61,6 +61,10 @@ def main() -> None:
 
     source = Path(args.excel_path)
     output = Path(args.output) if args.output else source
+    if not source.exists():
+        raise FileNotFoundError(f"Excel workbook not found: {source}")
+    if args.output and not output.parent.exists():
+        raise FileNotFoundError(f"Output directory not found: {output.parent}")
     _init_log(output)
     run_started = time.monotonic()
     _emit(f"Workbook: {source}")
@@ -348,6 +352,7 @@ def _init_log(excel_path: Path) -> None:
     global _log_path, _run_label
     _run_label = datetime.now().strftime("%Y-%m-%d %H:%M")
     _log_path = excel_path.parent / LOG_FILENAME
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
     _log_path.write_text(f"Run started: {_run_label}\n", encoding="utf-8")
 
 

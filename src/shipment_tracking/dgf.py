@@ -7,12 +7,12 @@ import os
 from typing import Any
 from urllib import parse, request
 
+from .destination import destination_aliases, matches_destination
 from .models import TrackingRecord
 from .time_utils import to_china_naive
 
 
 DEFAULT_API_BASE_URL = "https://api-eu.dhl.com/track"
-DEFAULT_DESTINATION_ALIASES = ("SHANGHAI", "上海", "PVG", "SHA", "CNSHA")
 
 
 @dataclass(frozen=True)
@@ -63,13 +63,13 @@ class DgfTrackingResult:
             )
 
         details = shipment.get("details") if isinstance(shipment.get("details"), dict) else {}
-        destination_aliases = _destination_aliases()
+        aliases = destination_aliases()
         route = _first(details, "dgf:routes") or []
-        route_item = _destination_route(route, destination_aliases)
+        route_item = _destination_route(route, aliases)
         events = shipment.get("events") if isinstance(shipment.get("events"), list) else []
 
-        actual_arrival = _find_destination_event_timestamp(events, "actual arrival at destination", destination_aliases)
-        eta_arrival = _parse_datetime(_first(route_item, "dgf:estimatedArrivalDate"))
+        actual_arrival = _actual_destination_arrival(events, aliases)
+        eta_arrival = _estimated_destination_arrival(events, route_item, aliases)
         actual_arrival = to_china_naive(actual_arrival)
         eta_arrival = to_china_naive(eta_arrival)
         call_for_pickup_date = to_china_naive(_find_event_timestamp(events, "estimated pick up date"))
@@ -191,10 +191,24 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _actual_destination_arrival(events: list[Any], aliases: tuple[str, ...]) -> datetime | None:
+    return (
+        _find_destination_event_timestamp(events, "actual vessel arrival", aliases)
+        or _find_destination_event_timestamp(events, "actual arrival at destination", aliases)
+    )
+
+
+def _estimated_destination_arrival(events: list[Any], route_item: dict[str, Any], aliases: tuple[str, ...]) -> datetime | None:
+    return (
+        _find_destination_event_timestamp(events, "estimated vessel arrival (last updated)", aliases)
+        or _find_destination_event_timestamp(events, "estimated vessel arrival", aliases)
+        or (_parse_datetime(_first(route_item, "dgf:estimatedArrivalDate")) if matches_destination(route_item, aliases) else None)
+    )
+
+
 def _find_destination_event_timestamp(events: list[Any], description_fragment: str, aliases: tuple[str, ...]) -> datetime | None:
     fragment = description_fragment.lower()
-    destination_matches: list[datetime] = []
-    all_matches: list[datetime] = []
+    matches: list[datetime] = []
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -204,13 +218,10 @@ def _find_destination_event_timestamp(events: list[Any], description_fragment: s
         parsed = _parse_datetime(event.get("timestamp"))
         if not parsed:
             continue
-        all_matches.append(parsed)
-        if _matches_destination(event.get("location"), aliases) or _matches_destination(event, aliases):
-            destination_matches.append(parsed)
-    if destination_matches:
-        return max(destination_matches)
-    if all_matches:
-        return max(all_matches)
+        if matches_destination(event.get("location"), aliases) or matches_destination(event, aliases):
+            matches.append(parsed)
+    if matches:
+        return max(matches)
     return None
 
 
@@ -232,11 +243,27 @@ def _find_event_timestamp(events: list[Any], description_fragment: str) -> datet
 
 def _departure_timestamp(events: list[Any], route_item: dict[str, Any]) -> datetime | None:
     return (
-        _find_event_timestamp(events, "actual vessel departure")
-        or _find_event_timestamp(events, "estimated vessel departure (last updated)")
-        or _find_event_timestamp(events, "estimated vessel departure")
+        _find_first_event_timestamp(events, "actual vessel departure")
+        or _find_first_event_timestamp(events, "estimated vessel departure (last updated)")
+        or _find_first_event_timestamp(events, "estimated vessel departure")
         or _parse_datetime(_first(route_item, "dgf:estimatedDepartureDate"))
     )
+
+
+def _find_first_event_timestamp(events: list[Any], description_fragment: str) -> datetime | None:
+    fragment = description_fragment.lower()
+    matches: list[datetime] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        description = str(event.get("description") or "").lower()
+        if fragment in description:
+            parsed = _parse_datetime(event.get("timestamp"))
+            if parsed:
+                matches.append(parsed)
+    if not matches:
+        return None
+    return min(matches)
 
 
 def _reference_numbers(references: list[Any], reference_type: str) -> list[str]:
@@ -276,10 +303,10 @@ def _destination_route(routes: Any, aliases: tuple[str, ...]) -> dict[str, Any]:
             "arrival",
             "dgf:arrival",
         )
-        if _matches_destination(destination, aliases):
+        if matches_destination(destination, aliases):
             return route_item
     for route_item in route_items:
-        if _matches_destination(route_item, aliases):
+        if matches_destination(route_item, aliases):
             return route_item
     return route_items[0] if route_items else {}
 
@@ -302,55 +329,6 @@ def _first_existing(value: dict[str, Any], *keys: str) -> Any:
         if key in value and value[key]:
             return value[key]
     return None
-
-
-def _destination_aliases() -> tuple[str, ...]:
-    raw = os.getenv("DGF_DESTINATION_ALIASES")
-    if not raw:
-        return DEFAULT_DESTINATION_ALIASES
-    aliases = tuple(alias.strip().upper() for alias in raw.split(",") if alias.strip())
-    return aliases or DEFAULT_DESTINATION_ALIASES
-
-
-def _matches_destination(value: Any, aliases: tuple[str, ...]) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, dict):
-        candidate_keys = {
-            "addressLocality",
-            "city",
-            "cityName",
-            "locationName",
-            "place",
-            "airportCode",
-            "iataCode",
-            "unLocationCode",
-            "UNLocationCode",
-            "code",
-            "locationCode",
-            "dgf:arrivalAirportCode",
-            "dgf:destinationAirportCode",
-            "dgf:arrivalCity",
-            "dgf:destinationCity",
-            "dgf:arrivalLocationCode",
-            "dgf:destinationLocationCode",
-        }
-        for key, child in value.items():
-            if key in candidate_keys and _string_matches_alias(child, aliases):
-                return True
-            if isinstance(child, (dict, list)) and _matches_destination(child, aliases):
-                return True
-        return False
-    if isinstance(value, list):
-        return any(_matches_destination(item, aliases) for item in value)
-    return _string_matches_alias(value, aliases)
-
-
-def _string_matches_alias(value: Any, aliases: tuple[str, ...]) -> bool:
-    text = str(value or "").strip().upper()
-    if not text:
-        return False
-    return any(alias in text for alias in aliases)
 
 
 def _string_from_location(value: Any) -> str | None:

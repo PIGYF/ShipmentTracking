@@ -8,6 +8,7 @@ from typing import Any
 from urllib import parse, request
 from urllib.error import HTTPError
 
+from .destination import destination_aliases, matches_destination
 from .models import TrackingRecord
 from .time_utils import to_china_naive
 
@@ -37,11 +38,12 @@ class DsvTrackingResult:
             )
 
         events = shipment.get("events") if isinstance(shipment.get("events"), list) else []
+        aliases = destination_aliases()
         booking_event = _earliest_event(events, "BOOKING")
         actual_pickup_event = _latest_event(events, "PCF") or _latest_event(events, "PUP")
-        departure_event = _latest_event(events, "DEP") or _latest_event(events, "ETD")
-        actual_arrival_event = _latest_event(events, "ARV")
-        eta_arrival_event = _latest_event(events, "ETA")
+        departure_event = _earliest_event(events, "DEP") or _earliest_event(events, "ETD")
+        actual_arrival_event = _latest_destination_event(events, "ARV", aliases)
+        eta_arrival_event = _latest_destination_event(events, "ETA", aliases)
 
         call_for_pickup_date = to_china_naive(_parse_datetime(booking_event.get("eventDate")) if booking_event else None)
         actual_pickup = to_china_naive(_parse_datetime(actual_pickup_event.get("eventDate")) if actual_pickup_event else None)
@@ -65,7 +67,7 @@ class DsvTrackingResult:
             call_for_pickup_date=call_for_pickup_date,
             departure_date=departure_date,
             actual_pickup=actual_pickup,
-            origin=_event_location(_latest_event(events, "DEP") or _latest_event(events, "ETD") or {}),
+            origin=_event_location(departure_event or {}),
             destination=_event_location(arrival_event),
             house_bill=self.query,
             master_bill=_string(shipment.get("shipmentId")),
@@ -213,6 +215,20 @@ def _earliest_event(events: list[Any], code: str) -> dict[str, Any] | None:
     if not matches:
         return None
     return min(matches, key=lambda event: _parse_datetime(event.get("eventDate")) or datetime.max)
+
+
+def _latest_destination_event(events: list[Any], code: str, aliases: tuple[str, ...]) -> dict[str, Any] | None:
+    matches = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("eventCode") or "").upper() == code
+        and not event.get("cancelled")
+        and (matches_destination(event.get("location"), aliases) or matches_destination(event, aliases))
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda event: _parse_datetime(event.get("eventDate")) or datetime.min)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
