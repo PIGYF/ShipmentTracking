@@ -6,6 +6,7 @@ import json
 import locale
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -41,6 +42,7 @@ COL_ARRIVAL_EN = "ARRIVAL_DATE"
 FILL_CHANGED = PatternFill("solid", fgColor="FFF2CC")
 FILL_ERROR = PatternFill("solid", fgColor="F4CCCC")
 FILL_WARNING = PatternFill("solid", fgColor="FCE5CD")
+DATED_REMARK_PREFIX = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?\]\s*")
 
 
 def update_tracking_workbook(
@@ -170,7 +172,7 @@ def _update_tracking_workbook_with_openpyxl(
 
         if remark:
             cell = sheet.cell(row=row, column=tracking_note_col)
-            cell.value = _append_text(cell.value, remark)
+            cell.value = _merge_tracking_note(cell.value, remark)
             if remark.startswith("ERROR") or remark.startswith("NOT_FOUND"):
                 cell.fill = FILL_ERROR
             elif "NO_ARRIVAL_DATE" in remark:
@@ -466,11 +468,30 @@ def _normalize_cell_value(value):
     return value
 
 
-def _append_text(existing, addition: str) -> str:
-    current = str(existing).strip() if existing is not None else ""
-    if not current:
-        return addition
-    return f"{current}\n{addition}"
+def _merge_tracking_note(existing, addition: str) -> str:
+    current_lines = _remark_lines(str(existing)) if existing is not None else []
+    for addition_line in _remark_lines(addition):
+        addition_body = _remark_body(addition_line)
+        matching_indexes = [
+            index
+            for index, current_line in enumerate(current_lines)
+            if _remark_body(current_line) == addition_body
+        ]
+        if not matching_indexes:
+            current_lines.append(addition_line)
+            continue
+        current_lines[matching_indexes[0]] = addition_line
+        for index in reversed(matching_indexes[1:]):
+            del current_lines[index]
+    return "\n".join(current_lines)
+
+
+def _remark_lines(value: str) -> list[str]:
+    return [line.strip() for line in value.splitlines() if line.strip()]
+
+
+def _remark_body(line: str) -> str:
+    return DATED_REMARK_PREFIX.sub("", line.strip(), count=1)
 
 
 def _join_remarks(existing: str | None, addition: str) -> str:
@@ -637,6 +658,47 @@ function Append-Remark([string]$existing, [string]$addition) {
     return $existing + "`n" + $addition
 }
 
+function Remark-Body([string]$line) {
+    if ([string]::IsNullOrWhiteSpace($line)) { return '' }
+    return ([regex]::Replace($line.Trim(), '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?\]\s*', '', 1))
+}
+
+function Remark-Lines([string]$value) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if ([string]::IsNullOrWhiteSpace($value)) { return ,$lines }
+    foreach ($line in ($value -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $lines.Add($trimmed)
+        }
+    }
+    return ,$lines
+}
+
+function Merge-Tracking-Note([string]$existing, [string]$addition) {
+    $currentLines = Remark-Lines $existing
+    foreach ($additionLine in (Remark-Lines $addition)) {
+        $additionBody = Remark-Body $additionLine
+        $matchingIndexes = [System.Collections.Generic.List[int]]::new()
+        for ($index = 0; $index -lt $currentLines.Count; $index++) {
+            if ((Remark-Body $currentLines[$index]) -eq $additionBody) {
+                $matchingIndexes.Add($index)
+            }
+        }
+
+        if ($matchingIndexes.Count -eq 0) {
+            $currentLines.Add($additionLine)
+            continue
+        }
+
+        $currentLines[$matchingIndexes[0]] = $additionLine
+        for ($index = $matchingIndexes.Count - 1; $index -ge 1; $index--) {
+            $currentLines.RemoveAt($matchingIndexes[$index])
+        }
+    }
+    return [string]::Join("`n", $currentLines)
+}
+
 function Update-Date-Cell($cell, [string]$dateText, [string]$carrierLabel, [string]$fieldLabel, [string]$runLabel, [string]$remark) {
     if ([string]::IsNullOrWhiteSpace($dateText)) {
         return @{ Changed = $false; Remark = $remark }
@@ -777,11 +839,7 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($remark)) {
             $remarkCell = $sheet.Cells.Item($row, $trackingNoteCol)
             $existing = ([string]$remarkCell.Text).Trim()
-            if ([string]::IsNullOrWhiteSpace($existing)) {
-                $remarkCell.Value2 = $remark
-            } else {
-                $remarkCell.Value2 = $existing + "`n" + $remark
-            }
+            $remarkCell.Value2 = Merge-Tracking-Note $existing $remark
             if ($remark.StartsWith('ERROR') -or $remark.StartsWith('NOT_FOUND')) {
                 $remarkCell.Interior.Color = 13421823
             } elseif ($remark.Contains('NO_ARRIVAL_DATE')) {
